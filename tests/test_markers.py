@@ -719,3 +719,369 @@ def test_pickle_marker_setstate_rejects_invalid_marker_string() -> None:
     m = Marker.__new__(Marker)
     with pytest.raises(TypeError, match="Cannot restore Marker"):
         m.__setstate__("this is not a valid marker")
+
+
+# ---------------------------------------------------------------------------
+# Extra normalization - parenthesized, nested, orientation, round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestExtraNormalizationParenthesized:
+    """Parenthesized extra comparisons must normalize exactly like top-level."""
+
+    @pytest.mark.parametrize(
+        ("raw", "normalized"),
+        [
+            ("Foo.Bar", "foo-bar"),
+            ("S_P__A_M", "s-p-a-m"),
+            ("UPPER", "upper"),
+            ("MiXeD...Case___Name", "mixed-case-name"),
+        ],
+    )
+    def test_single_paren_normalizes_str(self, raw: str, normalized: str) -> None:
+        top = Marker(f'extra == "{raw}"')
+        paren = Marker(f'(extra == "{raw}")')
+        assert str(top) == f'extra == "{normalized}"'
+        assert str(paren) == str(top)
+
+    @pytest.mark.parametrize(
+        ("raw", "normalized"),
+        [
+            ("Foo.Bar", "foo-bar"),
+            ("S_P__A_M", "s-p-a-m"),
+        ],
+    )
+    def test_double_paren_normalizes_str(self, raw: str, normalized: str) -> None:
+        top = Marker(f'extra == "{raw}"')
+        double = Marker(f'((extra == "{raw}"))')
+        assert str(double) == str(top)
+        assert str(double) == f'extra == "{normalized}"'
+
+    @pytest.mark.parametrize(
+        ("raw", "normalized"),
+        [
+            ("Foo.Bar", "foo-bar"),
+            ("MiXeD...Case___Name", "mixed-case-name"),
+        ],
+    )
+    def test_parenthesized_evaluates_like_top_level(
+        self, raw: str, normalized: str
+    ) -> None:
+        top = Marker(f'extra == "{raw}"')
+        paren = Marker(f'(extra == "{raw}")')
+        double = Marker(f'((extra == "{raw}"))')
+        env = {"extra": normalized}
+        assert top.evaluate(env) is True
+        assert paren.evaluate(env) is True
+        assert double.evaluate(env) is True
+
+    def test_parenthesized_equality_and_hash(self) -> None:
+        top = Marker('extra == "Foo.Bar"')
+        paren = Marker('(extra == "Foo.Bar")')
+        assert top == paren
+        assert hash(top) == hash(paren)
+
+
+class TestExtraNormalizationBoolean:
+    """Normalization within and/or boolean expressions."""
+
+    def test_extra_on_right_of_and(self) -> None:
+        m = Marker('python_version >= "3.6" and (extra == "Foo.Bar")')
+        assert 'extra == "foo-bar"' in str(m)
+        assert m.evaluate({"extra": "foo-bar", "python_version": "3.8"}) is True
+        assert m.evaluate({"extra": "foo-bar", "python_version": "2.7"}) is False
+
+    def test_extra_on_left_of_and(self) -> None:
+        m = Marker('(extra == "Foo.Bar") and python_version >= "3.6"')
+        assert 'extra == "foo-bar"' in str(m)
+        assert m.evaluate({"extra": "foo-bar", "python_version": "3.8"}) is True
+
+    def test_extra_on_right_of_or(self) -> None:
+        m = Marker('python_version < "3.0" or (extra == "Foo.Bar")')
+        assert 'extra == "foo-bar"' in str(m)
+        assert m.evaluate({"extra": "foo-bar", "python_version": "3.8"}) is True
+        assert m.evaluate({"extra": "other", "python_version": "3.8"}) is False
+
+    def test_extra_on_left_of_or(self) -> None:
+        m = Marker('(extra == "Foo.Bar") or python_version < "3.0"')
+        assert 'extra == "foo-bar"' in str(m)
+        assert m.evaluate({"extra": "foo-bar", "python_version": "3.8"}) is True
+
+    def test_multiple_differently_spelled_extras_in_or(self) -> None:
+        m = Marker('(extra == "Foo.Bar") or (extra == "S_P__A_M")')
+        assert str(m) == 'extra == "foo-bar" or extra == "s-p-a-m"'
+        assert m.evaluate({"extra": "foo-bar"}) is True
+        assert m.evaluate({"extra": "s-p-a-m"}) is True
+        assert m.evaluate({"extra": "other"}) is False
+
+    def test_multiple_differently_spelled_extras_in_and(self) -> None:
+        # This always evaluates False because extra can only be one value,
+        # but normalization must still apply.
+        m = Marker('(extra == "Foo.Bar") and (extra == "S_P__A_M")')
+        assert str(m) == 'extra == "foo-bar" and extra == "s-p-a-m"'
+
+    def test_extra_nested_in_complex_boolean(self) -> None:
+        m = Marker(
+            'python_version >= "3.6" and '
+            '(extra == "Foo.Bar" or extra == "S_P__A_M")'
+        )
+        assert '"foo-bar"' in str(m)
+        assert '"s-p-a-m"' in str(m)
+        env_foo = {"extra": "foo-bar", "python_version": "3.8"}
+        env_spam = {"extra": "s-p-a-m", "python_version": "3.8"}
+        env_other = {"extra": "other", "python_version": "3.8"}
+        assert m.evaluate(env_foo) is True
+        assert m.evaluate(env_spam) is True
+        assert m.evaluate(env_other) is False
+
+
+class TestExtraNormalizationOrientation:
+    """Both `extra == "name"` and `"name" == extra` must behave consistently."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["Foo.Bar", "S_P__A_M", "MiXeD...Case___Name"],
+    )
+    def test_reversed_top_level(self, raw: str) -> None:
+        lhs = Marker(f'extra == "{raw}"')
+        rhs = Marker(f'"{raw}" == extra')
+        # Both serialize with the normalized name.
+        lhs_str = str(lhs)
+        rhs_str = str(rhs)
+        normalized = lhs_str.split('"')[1]
+        assert f'"{normalized}"' in rhs_str
+        # Both evaluate the same.
+        assert lhs.evaluate({"extra": normalized}) is True
+        assert rhs.evaluate({"extra": normalized}) is True
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["Foo.Bar", "S_P__A_M"],
+    )
+    def test_reversed_parenthesized(self, raw: str) -> None:
+        lhs = Marker(f'(extra == "{raw}")')
+        rhs = Marker(f'("{raw}" == extra)')
+        lhs_normalized = str(Marker(f'extra == "{raw}"'))
+        # Parenthesized versions must produce the same serialized name.
+        assert str(lhs) == lhs_normalized
+        # Reversed keeps the "value" == extra order but normalizes value.
+        rhs_normalized = str(Marker(f'"{raw}" == extra'))
+        assert str(rhs) == rhs_normalized
+        # Both evaluate identically.
+        norm_name = lhs_normalized.split('"')[1]
+        assert lhs.evaluate({"extra": norm_name}) is True
+        assert rhs.evaluate({"extra": norm_name}) is True
+
+    def test_reversed_in_boolean_expr(self) -> None:
+        m = Marker(
+            'python_version >= "3.6" and ("Foo.Bar" == extra)'
+        )
+        assert '"foo-bar"' in str(m)
+        assert m.evaluate({"extra": "foo-bar", "python_version": "3.8"}) is True
+
+
+class TestExtraNormalizationPEP685Equivalence:
+    """PEP 685 equivalent spellings must match; genuinely different extras must not."""
+
+    @pytest.mark.parametrize(
+        ("marker_name", "env_name"),
+        [
+            # Case differences
+            ("SECURITY", "security"),
+            ("Security", "security"),
+            # Dot vs hyphen vs underscore
+            ("pep-685-norm", "pep-685-norm"),
+            ("pep_685_norm", "pep-685-norm"),
+            ("pep.685.norm", "pep-685-norm"),
+            ("PEP_685...norm", "pep-685-norm"),
+            # Runs of punctuation collapse
+            ("Different.punctuation..is...equal", "different-punctuation-is-equal"),
+            ("different__punctuation_is_EQUAL", "different-punctuation-is-equal"),
+        ],
+    )
+    def test_equivalent_spellings_match(
+        self, marker_name: str, env_name: str
+    ) -> None:
+        # Top-level
+        assert Marker(f'extra == "{marker_name}"').evaluate(
+            {"extra": env_name}
+        ) is True
+        # Parenthesized
+        assert Marker(f'(extra == "{marker_name}")').evaluate(
+            {"extra": env_name}
+        ) is True
+        # Nested in boolean
+        assert Marker(
+            f'python_version >= "3.0" and (extra == "{marker_name}")'
+        ).evaluate({"extra": env_name, "python_version": "3.8"}) is True
+
+    @pytest.mark.parametrize(
+        ("marker_name", "env_name"),
+        [
+            ("security", "crypto"),
+            ("foo-bar", "foo-baz"),
+            ("test", "tests"),
+        ],
+    )
+    def test_genuinely_different_extras_no_match(
+        self, marker_name: str, env_name: str
+    ) -> None:
+        assert Marker(f'extra == "{marker_name}"').evaluate(
+            {"extra": env_name}
+        ) is False
+        assert Marker(f'(extra == "{marker_name}")').evaluate(
+            {"extra": env_name}
+        ) is False
+
+    def test_pep685_equivalence_across_nesting_depths(self) -> None:
+        """All nesting depths must agree on whether two spellings match."""
+        spellings = ["Foo.Bar", "foo_bar", "FOO__BAR", "foo...bar"]
+        for s in spellings:
+            top = Marker(f'extra == "{s}"')
+            paren = Marker(f'(extra == "{s}")')
+            double = Marker(f'((extra == "{s}"))')
+            assert str(top) == str(paren) == str(double)
+            assert top.evaluate({"extra": "foo-bar"}) is True
+            assert paren.evaluate({"extra": "foo-bar"}) is True
+            assert double.evaluate({"extra": "foo-bar"}) is True
+
+
+class TestExtraNormalizationNoAccidentalEnvNorm:
+    """Non-extra environment variables must not be accidentally normalized."""
+
+    @pytest.mark.parametrize(
+        ("marker_str", "env_key", "env_val", "expected"),
+        [
+            # os_name preserves exact casing
+            ('(os_name == "Windows_NT")', "os_name", "Windows_NT", True),
+            ('(os_name == "Windows_NT")', "os_name", "windows-nt", False),
+            # platform_system preserves exact casing
+            (
+                'python_version >= "3.6" and (platform_system == "Win_32")',
+                "platform_system",
+                "Win_32",
+                True,
+            ),
+            (
+                'python_version >= "3.6" and (platform_system == "Win_32")',
+                "platform_system",
+                "win-32",
+                False,
+            ),
+            # sys_platform preserves exact value
+            ('(sys_platform == "linux_x86")', "sys_platform", "linux_x86", True),
+            ('(sys_platform == "linux_x86")', "sys_platform", "linux-x86", False),
+        ],
+    )
+    def test_non_extra_env_vars_not_normalized(
+        self,
+        marker_str: str,
+        env_key: str,
+        env_val: str,
+        expected: bool,
+    ) -> None:
+        env: dict[str, str] = {env_key: env_val}
+        if "python_version" in marker_str:
+            env["python_version"] = "3.8"
+        assert Marker(marker_str).evaluate(env) is expected
+
+    def test_os_name_str_not_altered(self) -> None:
+        """str() must not change an os_name value even if it looks like an extra."""
+        m = Marker('(os_name == "Some_Thing")')
+        assert 'os_name == "Some_Thing"' in str(m)
+
+
+class TestExtraNormalizationContextCompat:
+    """Evaluation contexts metadata/requirement/lock_file remain compatible."""
+
+    def test_metadata_context_defaults_extra_empty(self) -> None:
+        # Default context is "metadata"; extra defaults to ""
+        assert Marker('(extra == "foo")').evaluate() is False
+
+    def test_requirement_context_no_extra_key(self) -> None:
+        # In "requirement" context no extra is injected; non-extra markers work.
+        m = Marker('(os_name == "posix")')
+        assert m.evaluate({"os_name": "posix"}, context="requirement") is True
+
+    def test_lock_file_context_with_extras_set(self) -> None:
+        # lock_file context uses "extras" (set) not "extra" (str)
+        m = Marker('"foo" in extras')
+        assert m.evaluate({"extras": {"foo"}}, context="lock_file") is True
+        assert m.evaluate(context="lock_file") is False
+
+
+class TestExtraNormalizationRoundTrip:
+    """str() and pickle must preserve normalized semantics."""
+
+    @pytest.mark.parametrize(
+        "marker_str",
+        [
+            '(extra == "Foo.Bar")',
+            '((extra == "S_P__A_M"))',
+            'python_version >= "3.6" and (extra == "Foo.Bar")',
+            '(extra == "Foo.Bar") or (extra == "S_P__A_M")',
+            '("Foo.Bar" == extra)',
+            'python_version >= "3.6" and ("MiXeD...Case___Name" == extra)',
+        ],
+    )
+    def test_str_roundtrip_preserves_normalization(self, marker_str: str) -> None:
+        m = Marker(marker_str)
+        # Re-parse the serialized form
+        m2 = Marker(str(m))
+        assert str(m) == str(m2)
+        assert m == m2
+        assert hash(m) == hash(m2)
+
+    @pytest.mark.parametrize(
+        "marker_str",
+        [
+            '(extra == "Foo.Bar")',
+            '((extra == "S_P__A_M"))',
+            'python_version >= "3.6" and (extra == "Foo.Bar")',
+            '(extra == "Foo.Bar") or (extra == "S_P__A_M")',
+            '("Foo.Bar" == extra)',
+        ],
+    )
+    def test_pickle_roundtrip_preserves_normalization(self, marker_str: str) -> None:
+        m = Marker(marker_str)
+        loaded = pickle.loads(pickle.dumps(m))
+        assert loaded == m
+        assert str(loaded) == str(m)
+        # Evaluation must agree
+        normalized_name = str(m).split('"')[1]
+        env = {"extra": normalized_name}
+        assert loaded.evaluate(env) == m.evaluate(env)
+
+    @pytest.mark.parametrize(
+        "marker_str",
+        [
+            '(extra == "Foo.Bar")',
+            'python_version >= "3.6" and (extra == "S_P__A_M")',
+        ],
+    )
+    def test_setstate_str_preserves_normalization(self, marker_str: str) -> None:
+        """__setstate__ with a string re-parses and normalizes."""
+        m = Marker(marker_str)
+        m2 = Marker.__new__(Marker)
+        m2.__setstate__(str(m))
+        assert m2 == m
+        assert str(m2) == str(m)
+
+    def test_and_operator_preserves_extra_normalization(self) -> None:
+        a = Marker('extra == "Foo.Bar"')
+        b = Marker('python_version >= "3.6"')
+        combined = a & b
+        assert 'extra == "foo-bar"' in str(combined)
+        assert combined.evaluate(
+            {"extra": "foo-bar", "python_version": "3.8"}
+        ) is True
+
+    def test_or_operator_preserves_extra_normalization(self) -> None:
+        a = Marker('extra == "Foo.Bar"')
+        b = Marker('extra == "S_P__A_M"')
+        combined = a | b
+        assert '"foo-bar"' in str(combined)
+        assert '"s-p-a-m"' in str(combined)
+        assert combined.evaluate({"extra": "foo-bar"}) is True
+        assert combined.evaluate({"extra": "s-p-a-m"}) is True
+        assert combined.evaluate({"extra": "other"}) is False
